@@ -232,6 +232,53 @@ async def test_streaming_fallback_on_429(loaded_app, loaded_client, auth_headers
 
 
 @respx.mock
+async def test_upstream_401_returns_502_with_key_hint(loaded_app, loaded_client, auth_headers):
+    """OpenRouter 401 means our OPENROUTER_API_KEY is bad — must surface as 502."""
+    route = respx.post(_chat_url()).mock(
+        return_value=httpx.Response(401, json={"error": {"message": "no auth"}})
+    )
+    r = await loaded_client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 502
+    assert route.call_count == 1  # no fallback
+    err = r.json()["error"]
+    assert err["code"] == "upstream_auth_error"
+    assert "OPENROUTER_API_KEY" in err["message"]
+    assert "..." in err["message"] and "len=" in err["message"]
+
+
+@respx.mock
+async def test_upstream_403_returns_502(loaded_app, loaded_client, auth_headers):
+    respx.post(_chat_url()).mock(
+        return_value=httpx.Response(403, json={"error": {"message": "forbidden"}})
+    )
+    r = await loaded_client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 502
+    assert r.json()["error"]["code"] == "upstream_auth_error"
+
+
+@respx.mock
+async def test_streaming_upstream_401_returns_502(loaded_app, loaded_client, auth_headers):
+    respx.post(_chat_url()).mock(
+        return_value=httpx.Response(401, json={"error": {"message": "no auth"}})
+    )
+    r = await loaded_client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+    assert r.status_code == 502
+    assert r.json()["error"]["code"] == "upstream_auth_error"
+
+
+@respx.mock
 async def test_streaming_4xx_propagates_without_fallback(loaded_app, loaded_client, auth_headers):
     route = respx.post(_chat_url()).mock(
         return_value=httpx.Response(400, json={"error": {"message": "bad request"}})

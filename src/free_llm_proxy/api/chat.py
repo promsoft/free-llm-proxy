@@ -39,6 +39,83 @@ def _passthrough_client_error(exc: UpstreamError) -> JSONResponse:
     return JSONResponse(body, status_code=status)
 
 
+def _key_tail(key: str) -> str:
+    if not key:
+        return "(empty)"
+    if len(key) <= 4:
+        return f"len={len(key)}"
+    return f"...{key[-4:]} (len={len(key)})"
+
+
+def _upstream_auth_error_response(exc: UpstreamError, settings: Settings) -> JSONResponse:
+    """401/403 from upstream means our OPENROUTER_API_KEY is bad. Return 502."""
+    return JSONResponse(
+        {
+            "error": {
+                "code": "upstream_auth_error",
+                "message": (
+                    f"Proxy could not authenticate with upstream "
+                    f"(HTTP {exc.status_code}). Check OPENROUTER_API_KEY: "
+                    f"current key tail is {_key_tail(settings.openrouter_api_key)}."
+                ),
+                "type": "proxy_misconfiguration",
+            }
+        },
+        status_code=502,
+    )
+
+
+_NO_FALLBACK_OUTCOMES = frozenset({Outcome.CLIENT_ERROR, Outcome.UPSTREAM_AUTH_ERROR})
+
+
+def _terminal_error_response(
+    exc: UpstreamError,
+    request_id: str,
+    total_seconds: float,
+    attempts: list[dict[str, Any]],
+    body: dict,
+    settings: Settings,
+    *,
+    stream: bool,
+) -> JSONResponse:
+    if exc.outcome is Outcome.UPSTREAM_AUTH_ERROR:
+        response = _upstream_auth_error_response(exc, settings)
+        log_status = 502
+        log.error(
+            "request_done",
+            extra={
+                "request_id": request_id,
+                "duration_ms": int(total_seconds * 1000),
+                "status": log_status,
+                "chosen_model": None,
+                "stream": stream,
+                "attempts": attempts,
+                "had_tools": bool(body.get("tools")),
+                "had_response_format": bool(body.get("response_format")),
+                "reason": "upstream_auth_error",
+                "key_tail": _key_tail(settings.openrouter_api_key),
+            },
+        )
+    else:
+        response = _passthrough_client_error(exc)
+        log_status = exc.status_code or 502
+        log.info(
+            "request_done",
+            extra={
+                "request_id": request_id,
+                "duration_ms": int(total_seconds * 1000),
+                "status": log_status,
+                "chosen_model": None,
+                "stream": stream,
+                "attempts": attempts,
+                "had_tools": bool(body.get("tools")),
+                "had_response_format": bool(body.get("response_format")),
+            },
+        )
+    requests_total.labels(str(log_status)).inc()
+    return response
+
+
 def _cooldown_until(exc: UpstreamError, settings: Settings) -> datetime | None:
     if exc.outcome is Outcome.RATE_LIMITED:
         return exc.retry_after or (
@@ -143,7 +220,7 @@ async def _handle_nonstream(
     started: float,
 ):
     attempts: list[dict[str, Any]] = []
-    last_client_error: UpstreamError | None = None
+    terminal_error: UpstreamError | None = None
 
     for model in candidates:
         attempt_started = time.perf_counter()
@@ -151,7 +228,7 @@ async def _handle_nonstream(
             result = await upstream.chat(model.id, body)
         except UpstreamError as exc:
             duration_ms = int((time.perf_counter() - attempt_started) * 1000)
-            if exc.outcome is Outcome.CLIENT_ERROR:
+            if exc.outcome in _NO_FALLBACK_OUTCOMES:
                 _record_attempt(
                     attempts,
                     model_id=model.id,
@@ -159,7 +236,7 @@ async def _handle_nonstream(
                     duration_ms=duration_ms,
                     status_code=exc.status_code,
                 )
-                last_client_error = exc
+                terminal_error = exc
                 break
             cooldown_until = _apply_cooldown(registry.cooldowns, model.id, exc, settings)
             _record_attempt(
@@ -197,23 +274,10 @@ async def _handle_nonstream(
     total = time.perf_counter() - started
     request_duration_seconds.observe(total)
 
-    if last_client_error is not None:
-        status = last_client_error.status_code or 502
-        requests_total.labels(str(status)).inc()
-        log.info(
-            "request_done",
-            extra={
-                "request_id": request_id,
-                "duration_ms": int(total * 1000),
-                "status": status,
-                "chosen_model": None,
-                "stream": False,
-                "attempts": attempts,
-                "had_tools": bool(body.get("tools")),
-                "had_response_format": bool(body.get("response_format")),
-            },
+    if terminal_error is not None:
+        return _terminal_error_response(
+            terminal_error, request_id, total, attempts, body, settings, stream=False
         )
-        return _passthrough_client_error(last_client_error)
 
     requests_total.labels("503").inc()
     log.warning(
@@ -243,7 +307,7 @@ async def _handle_stream(
     started: float,
 ):
     attempts: list[dict[str, Any]] = []
-    last_client_error: UpstreamError | None = None
+    terminal_error: UpstreamError | None = None
 
     for model in candidates:
         attempt_started = time.perf_counter()
@@ -251,7 +315,7 @@ async def _handle_stream(
             stream = await upstream.chat_stream(model.id, body)
         except UpstreamError as exc:
             duration_ms = int((time.perf_counter() - attempt_started) * 1000)
-            if exc.outcome is Outcome.CLIENT_ERROR:
+            if exc.outcome in _NO_FALLBACK_OUTCOMES:
                 _record_attempt(
                     attempts,
                     model_id=model.id,
@@ -259,7 +323,7 @@ async def _handle_stream(
                     duration_ms=duration_ms,
                     status_code=exc.status_code,
                 )
-                last_client_error = exc
+                terminal_error = exc
                 break
             cooldown_until = _apply_cooldown(registry.cooldowns, model.id, exc, settings)
             _record_attempt(
@@ -296,23 +360,10 @@ async def _handle_stream(
     total = time.perf_counter() - started
     request_duration_seconds.observe(total)
 
-    if last_client_error is not None:
-        status = last_client_error.status_code or 502
-        requests_total.labels(str(status)).inc()
-        log.info(
-            "request_done",
-            extra={
-                "request_id": request_id,
-                "duration_ms": int(total * 1000),
-                "status": status,
-                "chosen_model": None,
-                "stream": True,
-                "attempts": attempts,
-                "had_tools": bool(body.get("tools")),
-                "had_response_format": bool(body.get("response_format")),
-            },
+    if terminal_error is not None:
+        return _terminal_error_response(
+            terminal_error, request_id, total, attempts, body, settings, stream=True
         )
-        return _passthrough_client_error(last_client_error)
 
     requests_total.labels("503").inc()
     log.warning(

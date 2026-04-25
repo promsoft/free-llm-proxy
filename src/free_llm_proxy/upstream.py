@@ -14,7 +14,9 @@ class Outcome(StrEnum):
     SUCCESS = "success"
     RATE_LIMITED = "rate_limited"  # cooldown, fallback
     UPSTREAM_ERROR = "upstream_error"  # 5xx/timeout: cooldown, fallback
-    CLIENT_ERROR = "client_error"  # 4xx (≠429): no fallback, propagate
+    # 401/403 from upstream: proxy config bug, no fallback, returned as 502
+    UPSTREAM_AUTH_ERROR = "upstream_auth_error"
+    CLIENT_ERROR = "client_error"  # other 4xx (≠429): no fallback, passthrough
 
 
 class UpstreamError(Exception):
@@ -97,6 +99,13 @@ def classify_exception(exc: BaseException) -> UpstreamError | None:
                 status_code=status,
                 message=str(exc),
                 retry_after=ra,
+                body=getattr(exc, "body", None),
+            )
+        if status in (401, 403):
+            return UpstreamError(
+                Outcome.UPSTREAM_AUTH_ERROR,
+                status_code=status,
+                message=str(exc),
                 body=getattr(exc, "body", None),
             )
         return UpstreamError(
