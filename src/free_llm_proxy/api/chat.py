@@ -40,8 +40,21 @@ async def chat_completions(
     registry: ModelRegistry = Depends(get_registry),
     settings: Settings = Depends(get_settings),
 ) -> Any:
-    body = await request.json()
+    try:
+        body = await request.json()
+    except ValueError as exc:
+        log.info("request_rejected", extra={"reason": "invalid_json", "error": str(exc)})
+        raise _err("invalid_json", "Request body is not valid JSON.", 400) from exc
+
     if body.get("stream"):
+        log.info(
+            "request_rejected",
+            extra={
+                "reason": "streaming_not_supported",
+                "had_tools": bool(body.get("tools")),
+                "had_response_format": bool(body.get("response_format")),
+            },
+        )
         raise _err(
             "streaming_not_supported",
             "Streaming is not supported by this proxy in MVP. Use stream=false.",
@@ -50,11 +63,23 @@ async def chat_completions(
 
     snap = registry.snapshot
     if snap is None or not snap.models:
+        log.info("request_rejected", extra={"reason": "not_ready"})
         raise _err("not_ready", "Model snapshot is not available yet.", 503)
 
     now = datetime.now(UTC)
     candidates = select_candidates(snap.models, body, registry.cooldowns, now)
     if not candidates:
+        log.info(
+            "request_rejected",
+            extra={
+                "reason": "no_capable_model",
+                "had_tools": bool(body.get("tools")),
+                "had_response_format": bool(body.get("response_format")),
+                "had_seed": body.get("seed") is not None,
+                "had_stop": body.get("stop") is not None,
+                "snapshot_size": len(snap.models),
+            },
+        )
         raise _err(
             "no_capable_model",
             "No model in current snapshot supports the requested capabilities.",
