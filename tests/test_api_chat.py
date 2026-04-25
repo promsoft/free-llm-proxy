@@ -188,6 +188,19 @@ async def test_unauthenticated_chat_returns_401(client):
 
 
 @respx.mock
+async def test_api_v1_alias_works(loaded_app, loaded_client, auth_headers):
+    first_id = loaded_app.state.registry.snapshot.models[0].id
+    respx.post(_chat_url()).mock(return_value=httpx.Response(200, json=_completion(first_id)))
+    r = await loaded_client.post(
+        "/api/v1/chat/completions",
+        headers=auth_headers,
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 200
+    assert r.headers["x-free-llm-proxy-model"] == first_id
+
+
+@respx.mock
 async def test_capability_filter_routes_around_unsupported_first_model(app, client, auth_headers):
     from free_llm_proxy.models import Model
 

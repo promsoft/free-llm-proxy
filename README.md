@@ -66,6 +66,10 @@ print(resp.choices[0].message.content)
 |-------|--------------------------|--------|-----------------------------------------------|
 | POST  | `/v1/chat/completions`   | Bearer | OpenAI-совместимый chat (без stream)          |
 | GET   | `/v1/models`             | Bearer | Текущий snapshot моделей в OpenAI-формате     |
+
+`/v1/...` и `/api/v1/...` работают одинаково — алиас для клиентов,
+которые ожидают OpenRouter-style путь (`base_url=.../api/v1`).
+
 | POST  | `/admin/refresh`         | Bearer | Принудительно перечитать список + сбросить cooldowns |
 | GET   | `/health`                | —      | `{"status": "ok"}` пока процесс жив           |
 | GET   | `/ready`                 | —      | 200 если есть свободная модель, 503 иначе     |

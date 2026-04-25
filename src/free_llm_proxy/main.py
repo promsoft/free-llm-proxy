@@ -38,6 +38,9 @@ def create_app(settings: Settings | None = None, *, auto_start_refresher: bool =
     app.include_router(admin.router)
     app.include_router(chat.router)
     app.include_router(models_endpoint.router)
+    # OpenRouter-style alias: many OpenAI-compatible clients append /api/v1.
+    app.include_router(chat.router, prefix="/api")
+    app.include_router(models_endpoint.router, prefix="/api")
     return app
 
 
