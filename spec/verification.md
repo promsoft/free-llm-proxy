@@ -65,7 +65,12 @@
   - capability-фильтр: запрос с `tools=[...]` → модели без
     `supportsTools` пропущены даже при низком `rank`;
   - после фильтра пусто → 400 `no_capable_model`;
-  - `stream=true` → 400 `streaming_not_supported`.
+  - `stream=true` happy path: ответ `text/event-stream`, заголовок
+    `x-free-llm-proxy-model` присутствует, в теле минимум 4 `data:`
+    события (3 чанка + `[DONE]`);
+  - `stream=true` с 429 на первой модели → fallback на вторую,
+    клиент получает обычный SSE второй модели;
+  - `stream=true` с 400 → passthrough клиенту, fallback не триггерится.
 - `GET /v1/models` — проекция snapshot в OpenAI-формат, сортировка по
   `rank`; пустой snapshot → 503.
 - `GET /ready` — 200 если есть хотя бы одна модель не в cooldown'е,

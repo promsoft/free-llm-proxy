@@ -4,7 +4,8 @@ from enum import StrEnum
 from typing import Any
 
 import httpx
-from openai import APIStatusError, APITimeoutError, AsyncOpenAI, RateLimitError
+from openai import APIStatusError, APITimeoutError, AsyncOpenAI, AsyncStream, RateLimitError
+from openai.types.chat import ChatCompletionChunk
 
 from .config import Settings
 
@@ -63,6 +64,56 @@ def parse_retry_after(headers: httpx.Headers | dict[str, str], now: datetime) ->
     return None
 
 
+def classify_exception(exc: BaseException) -> UpstreamError | None:
+    """Map openai SDK / httpx exceptions to UpstreamError. Returns None if unknown."""
+    if isinstance(exc, RateLimitError):
+        now = datetime.now(UTC)
+        retry_after = (
+            parse_retry_after(getattr(exc, "response", None).headers, now)
+            if getattr(exc, "response", None) is not None
+            else None
+        )
+        return UpstreamError(
+            Outcome.RATE_LIMITED,
+            status_code=429,
+            message=str(exc),
+            retry_after=retry_after,
+            body=getattr(exc, "body", None),
+        )
+    if isinstance(exc, APITimeoutError):
+        return UpstreamError(
+            Outcome.UPSTREAM_ERROR,
+            status_code=None,
+            message=f"upstream timeout: {exc}",
+        )
+    if isinstance(exc, APIStatusError):
+        status = exc.status_code
+        ra: datetime | None = None
+        if status == 503 and exc.response is not None:
+            ra = parse_retry_after(exc.response.headers, datetime.now(UTC))
+        if 500 <= status < 600:
+            return UpstreamError(
+                Outcome.UPSTREAM_ERROR,
+                status_code=status,
+                message=str(exc),
+                retry_after=ra,
+                body=getattr(exc, "body", None),
+            )
+        return UpstreamError(
+            Outcome.CLIENT_ERROR,
+            status_code=status,
+            message=str(exc),
+            body=getattr(exc, "body", None),
+        )
+    if isinstance(exc, httpx.HTTPError):
+        return UpstreamError(
+            Outcome.UPSTREAM_ERROR,
+            status_code=None,
+            message=f"transport error: {exc}",
+        )
+    return None
+
+
 class Upstream:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -84,56 +135,26 @@ class Upstream:
         params = {**body, "model": model_id, "stream": False}
         try:
             resp = await self._client.chat.completions.create(**params)
-        except RateLimitError as exc:
-            now = datetime.now(UTC)
-            retry_after = (
-                parse_retry_after(getattr(exc, "response", None).headers, now)
-                if getattr(exc, "response", None) is not None
-                else None
-            )
-            raise UpstreamError(
-                Outcome.RATE_LIMITED,
-                status_code=429,
-                message=str(exc),
-                retry_after=retry_after,
-                body=getattr(exc, "body", None),
-            ) from exc
-        except APITimeoutError as exc:
-            raise UpstreamError(
-                Outcome.UPSTREAM_ERROR,
-                status_code=None,
-                message=f"upstream timeout: {exc}",
-            ) from exc
-        except APIStatusError as exc:
-            status = exc.status_code
-            if status == 503:
-                now = datetime.now(UTC)
-                ra = parse_retry_after(exc.response.headers, now) if exc.response else None
-                raise UpstreamError(
-                    Outcome.UPSTREAM_ERROR,
-                    status_code=status,
-                    message=str(exc),
-                    retry_after=ra,
-                    body=getattr(exc, "body", None),
-                ) from exc
-            if 500 <= status < 600:
-                raise UpstreamError(
-                    Outcome.UPSTREAM_ERROR,
-                    status_code=status,
-                    message=str(exc),
-                    body=getattr(exc, "body", None),
-                ) from exc
-            raise UpstreamError(
-                Outcome.CLIENT_ERROR,
-                status_code=status,
-                message=str(exc),
-                body=getattr(exc, "body", None),
-            ) from exc
-        except (httpx.TransportError, httpx.HTTPError) as exc:
-            raise UpstreamError(
-                Outcome.UPSTREAM_ERROR,
-                status_code=None,
-                message=f"transport error: {exc}",
-            ) from exc
-
+        except Exception as exc:
+            err = classify_exception(exc)
+            if err is None:
+                raise
+            raise err from exc
         return resp.model_dump()
+
+    async def chat_stream(
+        self, model_id: str, body: dict[str, Any]
+    ) -> AsyncStream[ChatCompletionChunk]:
+        """Open a streaming completion. Raises UpstreamError on creation-time failures.
+
+        Iteration on the returned stream may also raise (mid-stream errors); the
+        caller is responsible for catching those — use `classify_exception` to map.
+        """
+        params = {**body, "model": model_id, "stream": True}
+        try:
+            return await self._client.chat.completions.create(**params)
+        except Exception as exc:
+            err = classify_exception(exc)
+            if err is None:
+                raise
+            raise err from exc

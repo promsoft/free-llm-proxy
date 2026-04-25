@@ -77,7 +77,10 @@ print(resp.choices[0].message.content)
 
 ## Поведение
 
-- **Streaming не поддерживается** в MVP — `stream=true` → `400 streaming_not_supported`.
+- **Streaming поддерживается** — `stream=true` отвечает SSE в формате
+  OpenAI Chat Completions chunks с `data: [DONE]` в конце. Fallback
+  работает, пока первый чанк не отправлен клиенту; mid-stream ошибка
+  отдаётся как `data: {"error": {...}}` + `data: [DONE]`.
 - **Модель в запросе игнорируется** — прокси сам выбирает по rank и capability.
 - **429 / 503 от OpenRouter** → cooldown с уважением к `Retry-After` (дефолт 5 мин) → следующая модель.
 - **5xx / timeout** → cooldown 60 c → следующая.

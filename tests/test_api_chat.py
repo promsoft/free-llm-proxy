@@ -143,14 +143,122 @@ async def test_all_models_unavailable_returns_503(loaded_app, loaded_client, aut
     assert r.json()["detail"]["error"]["code"] == "all_models_unavailable"
 
 
-async def test_streaming_request_returns_400(loaded_client, auth_headers):
+def _sse_stream_payload(model_id: str, content: str = "Hello") -> bytes:
+    chunks = [
+        {
+            "id": "chatcmpl-stream",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": model_id,
+            "choices": [
+                {"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}
+            ],
+        },
+        {
+            "id": "chatcmpl-stream",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": model_id,
+            "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+        },
+        {
+            "id": "chatcmpl-stream",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": model_id,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        },
+    ]
+    body = b""
+    for c in chunks:
+        body += f"data: {json.dumps(c)}\n\n".encode()
+    body += b"data: [DONE]\n\n"
+    return body
+
+
+def _sse_response(model_id: str, content: str = "Hello") -> httpx.Response:
+    return httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=_sse_stream_payload(model_id, content),
+    )
+
+
+@respx.mock
+async def test_streaming_happy_path(loaded_app, loaded_client, auth_headers):
+    first_id = loaded_app.state.registry.snapshot.models[0].id
+    respx.post(_chat_url()).mock(return_value=_sse_response(first_id, "Hi"))
+    async with loaded_client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+    ) as r:
+        assert r.status_code == 200
+        assert r.headers["x-free-llm-proxy-model"] == first_id
+        assert r.headers["content-type"].startswith("text/event-stream")
+        body = b""
+        async for piece in r.aiter_bytes():
+            body += piece
+    text = body.decode()
+    assert text.count("data:") >= 4  # 3 chunks + [DONE]
+    assert text.endswith("data: [DONE]\n\n")
+    assert '"content": "Hi"' in text
+
+
+@respx.mock
+async def test_streaming_fallback_on_429(loaded_app, loaded_client, auth_headers):
+    snap = loaded_app.state.registry.snapshot
+    first_id, second_id = snap.models[0].id, snap.models[1].id
+    respx.post(_chat_url()).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "60"}, json={"error": {"message": "rl"}}),
+            _sse_response(second_id, "Yo"),
+        ]
+    )
+    async with loaded_client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+    ) as r:
+        assert r.status_code == 200
+        assert r.headers["x-free-llm-proxy-model"] == second_id
+        body = b""
+        async for piece in r.aiter_bytes():
+            body += piece
+    assert b"data: [DONE]" in body
+    assert first_id in loaded_app.state.registry.cooldowns.until
+
+
+@respx.mock
+async def test_streaming_4xx_propagates_without_fallback(loaded_app, loaded_client, auth_headers):
+    route = respx.post(_chat_url()).mock(
+        return_value=httpx.Response(400, json={"error": {"message": "bad request"}})
+    )
     r = await loaded_client.post(
         "/v1/chat/completions",
         headers=auth_headers,
         json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
     )
     assert r.status_code == 400
-    assert r.json()["detail"]["error"]["code"] == "streaming_not_supported"
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_streaming_all_unavailable_503(loaded_client, auth_headers):
+    respx.post(_chat_url()).mock(
+        return_value=httpx.Response(
+            429, headers={"Retry-After": "60"}, json={"error": {"message": "rl"}}
+        )
+    )
+    r = await loaded_client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+    assert r.status_code == 503
+    assert r.json()["detail"]["error"]["code"] == "all_models_unavailable"
 
 
 async def test_no_capable_model_returns_400(app, client, auth_headers):

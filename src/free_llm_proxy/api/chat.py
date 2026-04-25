@@ -1,19 +1,24 @@
+import contextlib
+import json
 import time
 import uuid
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from openai import AsyncStream
+from openai.types.chat import ChatCompletionChunk
 
 from ..auth import require_proxy_key
 from ..config import Settings, get_settings
 from ..deps import get_registry
 from ..logging import get_logger
 from ..metrics import request_duration_seconds, requests_total, upstream_attempts_total
-from ..registry import ModelRegistry
+from ..registry import Cooldowns, ModelRegistry
 from ..router import select_candidates
-from ..upstream import Outcome, Upstream, UpstreamError
+from ..upstream import Outcome, Upstream, UpstreamError, classify_exception
 
 router = APIRouter(prefix="/v1", tags=["chat"], dependencies=[Depends(require_proxy_key)])
 log = get_logger(__name__)
@@ -34,6 +39,49 @@ def _passthrough_client_error(exc: UpstreamError) -> JSONResponse:
     return JSONResponse(body, status_code=status)
 
 
+def _cooldown_until(exc: UpstreamError, settings: Settings) -> datetime | None:
+    if exc.outcome is Outcome.RATE_LIMITED:
+        return exc.retry_after or (
+            datetime.now(UTC) + timedelta(seconds=settings.rate_limit_cooldown_sec)
+        )
+    if exc.outcome is Outcome.UPSTREAM_ERROR:
+        return exc.retry_after or (
+            datetime.now(UTC) + timedelta(seconds=settings.generic_error_cooldown_sec)
+        )
+    return None
+
+
+def _record_attempt(
+    attempts: list[dict[str, Any]],
+    *,
+    model_id: str,
+    outcome: Outcome,
+    duration_ms: int,
+    status_code: int | None = None,
+    cooldown_until: datetime | None = None,
+) -> None:
+    upstream_attempts_total.labels(model_id, outcome.value).inc()
+    entry: dict[str, Any] = {
+        "model": model_id,
+        "outcome": outcome.value,
+        "duration_ms": duration_ms,
+    }
+    if status_code is not None:
+        entry["status"] = status_code
+    if cooldown_until is not None:
+        entry["cooldown_until"] = cooldown_until.isoformat()
+    attempts.append(entry)
+
+
+def _apply_cooldown(
+    cooldowns: Cooldowns, model_id: str, exc: UpstreamError, settings: Settings
+) -> datetime | None:
+    until = _cooldown_until(exc, settings)
+    if until is not None:
+        cooldowns.mark(model_id, until)
+    return until
+
+
 @router.post("/chat/completions")
 async def chat_completions(
     request: Request,
@@ -46,20 +94,7 @@ async def chat_completions(
         log.info("request_rejected", extra={"reason": "invalid_json", "error": str(exc)})
         raise _err("invalid_json", "Request body is not valid JSON.", 400) from exc
 
-    if body.get("stream"):
-        log.info(
-            "request_rejected",
-            extra={
-                "reason": "streaming_not_supported",
-                "had_tools": bool(body.get("tools")),
-                "had_response_format": bool(body.get("response_format")),
-            },
-        )
-        raise _err(
-            "streaming_not_supported",
-            "Streaming is not supported by this proxy in MVP. Use stream=false.",
-            400,
-        )
+    is_stream = bool(body.get("stream"))
 
     snap = registry.snapshot
     if snap is None or not snap.models:
@@ -88,73 +123,70 @@ async def chat_completions(
 
     upstream: Upstream = request.app.state.upstream
     request_id = uuid.uuid4().hex
-    attempts: list[dict[str, Any]] = []
     started = time.perf_counter()
+    capped = candidates[: settings.max_fallback_attempts]
+
+    if is_stream:
+        return await _handle_stream(
+            request, upstream, registry, settings, body, capped, request_id, started
+        )
+    return await _handle_nonstream(upstream, registry, settings, body, capped, request_id, started)
+
+
+async def _handle_nonstream(
+    upstream: Upstream,
+    registry: ModelRegistry,
+    settings: Settings,
+    body: dict,
+    candidates: list,
+    request_id: str,
+    started: float,
+):
+    attempts: list[dict[str, Any]] = []
     last_client_error: UpstreamError | None = None
 
-    for model in candidates[: settings.max_fallback_attempts]:
+    for model in candidates:
         attempt_started = time.perf_counter()
         try:
             result = await upstream.chat(model.id, body)
         except UpstreamError as exc:
             duration_ms = int((time.perf_counter() - attempt_started) * 1000)
-
-            upstream_attempts_total.labels(model.id, exc.outcome.value).inc()
-
             if exc.outcome is Outcome.CLIENT_ERROR:
-                attempts.append(
-                    {
-                        "model": model.id,
-                        "outcome": exc.outcome.value,
-                        "status": exc.status_code,
-                        "duration_ms": duration_ms,
-                    }
+                _record_attempt(
+                    attempts,
+                    model_id=model.id,
+                    outcome=exc.outcome,
+                    duration_ms=duration_ms,
+                    status_code=exc.status_code,
                 )
                 last_client_error = exc
                 break
-
-            cooldown_until: datetime | None = None
-            if exc.outcome is Outcome.RATE_LIMITED:
-                cooldown_until = exc.retry_after or (
-                    datetime.now(UTC) + timedelta(seconds=settings.rate_limit_cooldown_sec)
-                )
-            elif exc.outcome is Outcome.UPSTREAM_ERROR:
-                cooldown_until = exc.retry_after or (
-                    datetime.now(UTC) + timedelta(seconds=settings.generic_error_cooldown_sec)
-                )
-            if cooldown_until is not None:
-                registry.cooldowns.mark(model.id, cooldown_until)
-
-            attempts.append(
-                {
-                    "model": model.id,
-                    "outcome": exc.outcome.value,
-                    "status": exc.status_code,
-                    "duration_ms": duration_ms,
-                    "cooldown_until": cooldown_until.isoformat() if cooldown_until else None,
-                }
+            cooldown_until = _apply_cooldown(registry.cooldowns, model.id, exc, settings)
+            _record_attempt(
+                attempts,
+                model_id=model.id,
+                outcome=exc.outcome,
+                duration_ms=duration_ms,
+                status_code=exc.status_code,
+                cooldown_until=cooldown_until,
             )
             continue
 
         duration_ms = int((time.perf_counter() - attempt_started) * 1000)
-        attempts.append(
-            {
-                "model": model.id,
-                "outcome": Outcome.SUCCESS.value,
-                "duration_ms": duration_ms,
-            }
+        _record_attempt(
+            attempts, model_id=model.id, outcome=Outcome.SUCCESS, duration_ms=duration_ms
         )
-        upstream_attempts_total.labels(model.id, Outcome.SUCCESS.value).inc()
-        total_duration = time.perf_counter() - started
-        request_duration_seconds.observe(total_duration)
+        total = time.perf_counter() - started
+        request_duration_seconds.observe(total)
         requests_total.labels("200").inc()
         log.info(
             "request_done",
             extra={
                 "request_id": request_id,
-                "duration_ms": int(total_duration * 1000),
+                "duration_ms": int(total * 1000),
                 "status": 200,
                 "chosen_model": model.id,
+                "stream": False,
                 "attempts": attempts,
                 "had_tools": bool(body.get("tools")),
                 "had_response_format": bool(body.get("response_format")),
@@ -162,8 +194,8 @@ async def chat_completions(
         )
         return JSONResponse(result, headers={"x-free-llm-proxy-model": model.id})
 
-    total_duration = time.perf_counter() - started
-    request_duration_seconds.observe(total_duration)
+    total = time.perf_counter() - started
+    request_duration_seconds.observe(total)
 
     if last_client_error is not None:
         status = last_client_error.status_code or 502
@@ -172,9 +204,10 @@ async def chat_completions(
             "request_done",
             extra={
                 "request_id": request_id,
-                "duration_ms": int(total_duration * 1000),
+                "duration_ms": int(total * 1000),
                 "status": status,
                 "chosen_model": None,
+                "stream": False,
                 "attempts": attempts,
                 "had_tools": bool(body.get("tools")),
                 "had_response_format": bool(body.get("response_format")),
@@ -187,16 +220,191 @@ async def chat_completions(
         "request_done",
         extra={
             "request_id": request_id,
-            "duration_ms": int(total_duration * 1000),
+            "duration_ms": int(total * 1000),
             "status": 503,
             "chosen_model": None,
+            "stream": False,
             "attempts": attempts,
             "had_tools": bool(body.get("tools")),
             "had_response_format": bool(body.get("response_format")),
         },
     )
-    raise _err(
-        "all_models_unavailable",
-        "All candidate models failed; try again later.",
-        503,
+    raise _err("all_models_unavailable", "All candidate models failed; try again later.", 503)
+
+
+async def _handle_stream(
+    request: Request,
+    upstream: Upstream,
+    registry: ModelRegistry,
+    settings: Settings,
+    body: dict,
+    candidates: list,
+    request_id: str,
+    started: float,
+):
+    attempts: list[dict[str, Any]] = []
+    last_client_error: UpstreamError | None = None
+
+    for model in candidates:
+        attempt_started = time.perf_counter()
+        try:
+            stream = await upstream.chat_stream(model.id, body)
+        except UpstreamError as exc:
+            duration_ms = int((time.perf_counter() - attempt_started) * 1000)
+            if exc.outcome is Outcome.CLIENT_ERROR:
+                _record_attempt(
+                    attempts,
+                    model_id=model.id,
+                    outcome=exc.outcome,
+                    duration_ms=duration_ms,
+                    status_code=exc.status_code,
+                )
+                last_client_error = exc
+                break
+            cooldown_until = _apply_cooldown(registry.cooldowns, model.id, exc, settings)
+            _record_attempt(
+                attempts,
+                model_id=model.id,
+                outcome=exc.outcome,
+                duration_ms=duration_ms,
+                status_code=exc.status_code,
+                cooldown_until=cooldown_until,
+            )
+            continue
+
+        # We have a live SSE connection — commit and return StreamingResponse.
+        return StreamingResponse(
+            _emit_sse(
+                stream,
+                model_id=model.id,
+                attempts=attempts,
+                attempt_started=attempt_started,
+                request_id=request_id,
+                started=started,
+                body=body,
+                cooldowns=registry.cooldowns,
+                settings=settings,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "x-free-llm-proxy-model": model.id,
+                "Cache-Control": "no-cache, no-store",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    total = time.perf_counter() - started
+    request_duration_seconds.observe(total)
+
+    if last_client_error is not None:
+        status = last_client_error.status_code or 502
+        requests_total.labels(str(status)).inc()
+        log.info(
+            "request_done",
+            extra={
+                "request_id": request_id,
+                "duration_ms": int(total * 1000),
+                "status": status,
+                "chosen_model": None,
+                "stream": True,
+                "attempts": attempts,
+                "had_tools": bool(body.get("tools")),
+                "had_response_format": bool(body.get("response_format")),
+            },
+        )
+        return _passthrough_client_error(last_client_error)
+
+    requests_total.labels("503").inc()
+    log.warning(
+        "request_done",
+        extra={
+            "request_id": request_id,
+            "duration_ms": int(total * 1000),
+            "status": 503,
+            "chosen_model": None,
+            "stream": True,
+            "attempts": attempts,
+            "had_tools": bool(body.get("tools")),
+            "had_response_format": bool(body.get("response_format")),
+        },
+    )
+    raise _err("all_models_unavailable", "All candidate models failed; try again later.", 503)
+
+
+def _sse_data(payload: dict) -> bytes:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+
+
+SSE_DONE = b"data: [DONE]\n\n"
+
+
+async def _emit_sse(
+    stream: AsyncStream[ChatCompletionChunk],
+    *,
+    model_id: str,
+    attempts: list[dict[str, Any]],
+    attempt_started: float,
+    request_id: str,
+    started: float,
+    body: dict,
+    cooldowns: Cooldowns,
+    settings: Settings,
+) -> AsyncIterator[bytes]:
+    """Serialize chunks as SSE; on mid-stream error, emit error event then [DONE]."""
+    mid_error: UpstreamError | None = None
+    chunks_emitted = 0
+    try:
+        async for chunk in stream:
+            chunks_emitted += 1
+            yield _sse_data(chunk.model_dump())
+    except Exception as exc:
+        mid_error = classify_exception(exc) or UpstreamError(
+            Outcome.UPSTREAM_ERROR, status_code=None, message=f"stream error: {exc}"
+        )
+        # No fallback once chunks have started — emit error event in-band.
+        # Still mark cooldown so the model gets a rest on the next request.
+        _apply_cooldown(cooldowns, model_id, mid_error, settings)
+        yield _sse_data(
+            {
+                "error": {
+                    "message": mid_error.message,
+                    "code": mid_error.outcome.value,
+                    "type": "upstream_error",
+                }
+            }
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await stream.close()
+
+    yield SSE_DONE
+
+    duration_ms = int((time.perf_counter() - attempt_started) * 1000)
+    outcome = Outcome.SUCCESS if mid_error is None else mid_error.outcome
+    _record_attempt(
+        attempts,
+        model_id=model_id,
+        outcome=outcome,
+        duration_ms=duration_ms,
+        status_code=mid_error.status_code if mid_error else None,
+    )
+    total = time.perf_counter() - started
+    request_duration_seconds.observe(total)
+    status_label = "200" if mid_error is None else "200/mid_error"
+    requests_total.labels(status_label).inc()
+    log_level = log.info if mid_error is None else log.warning
+    log_level(
+        "request_done",
+        extra={
+            "request_id": request_id,
+            "duration_ms": int(total * 1000),
+            "status": 200,
+            "chosen_model": model_id,
+            "stream": True,
+            "chunks_emitted": chunks_emitted,
+            "mid_stream_error": mid_error.outcome.value if mid_error else None,
+            "attempts": attempts,
+            "had_tools": bool(body.get("tools")),
+            "had_response_format": bool(body.get("response_format")),
+        },
     )
