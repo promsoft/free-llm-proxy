@@ -1,0 +1,108 @@
+{
+  "updatedAt": "2026-04-25T03:17:45.681Z",
+  "source": "openrouter-models-api",
+  "rankingVersion": "2026-04-25.v1",
+  "probeMode": "active",
+  "baseUrl": "https://openrouter.ai/api/v1",
+  "createKeyUrl": "https://openrouter.ai/settings/keys",
+  "fallback": {
+    "id": "openrouter/free",
+    "reason": "OpenRouter-managed free model router"
+  },
+  "count": 6,
+  "models": [
+    {
+      "rank": 1,
+      "id": "inclusionai/ling-2.6-flash:free",
+      "name": "inclusionAI: Ling-2.6-flash (free)",
+      "score": 1075,
+      "contextLength": 262144,
+      "maxCompletionTokens": 32768,
+      "supportsTools": true,
+      "supportsToolChoice": true,
+      "supportsStructuredOutputs": true,
+      "supportsResponseFormat": true,
+      "supportsReasoning": false,
+      "supportsIncludeReasoning": false,
+      "supportsSeed": true,
+      "supportsStop": true,
+      "latencyMs": 853,
+      "healthStatus": "passed",
+      "reason": "Tools, structured outputs, 262k context"
+    },
+    {
+      "rank": 2,
+      "id": "inclusionai/ling-2.6-1t:free",
+      "name": "inclusionAI: Ling-2.6-1T (free)",
+      "score": 1060,
+      "reason": "Tools, structured outputs, 262k context",
+      "contextLength": 262144,
+      "maxCompletionTokens": 32768,
+      "supportsTools": true,
+      "supportsStructuredOutputs": true,
+      "supportsReasoning": false,
+      "healthStatus": "passed",
+      "latencyMs": 1006
+    },
+    {
+      "rank": 3,
+      "id": "minimax/minimax-m2.5:free",
+      "name": "MiniMax: MiniMax M2.5 (free)",
+      "score": 988,
+      "reason": "Tools, reasoning, 128k+ context",
+      "contextLength": 196608,
+      "maxCompletionTokens": 8192,
+      "supportsTools": true,
+      "supportsStructuredOutputs": false,
+      "supportsReasoning": true,
+      "healthStatus": "passed",
+      "latencyMs": 772
+    },
+    {
+      "rank": 4,
+      "id": "openai/gpt-oss-120b:free",
+      "name": "OpenAI: gpt-oss-120b (free)",
+      "score": 920,
+      "reason": "Tools, reasoning, 128k+ context",
+      "contextLength": 131072,
+      "maxCompletionTokens": 131072,
+      "supportsTools": true,
+      "supportsStructuredOutputs": false,
+      "supportsReasoning": true,
+      "healthStatus": "passed",
+      "latencyMs": 1305
+    },
+    {
+      "rank": 5,
+      "id": "openai/gpt-oss-20b:free",
+      "name": "OpenAI: gpt-oss-20b (free)",
+      "score": 920,
+      "reason": "Tools, reasoning, 128k+ context",
+      "contextLength": 131072,
+      "maxCompletionTokens": 8192,
+      "supportsTools": true,
+      "supportsStructuredOutputs": false,
+      "supportsReasoning": true,
+      "healthStatus": "passed",
+      "latencyMs": 1452
+    },
+    {
+      "rank": 6,
+      "id": "nvidia/nemotron-3-super-120b-a12b:free",
+      "name": "NVIDIA: Nemotron 3 Super (free)",
+      "score": 855,
+      "reason": "Tools, structured outputs, reasoning",
+      "contextLength": 262144,
+      "maxCompletionTokens": 262144,
+      "supportsTools": true,
+      "supportsStructuredOutputs": true,
+      "supportsReasoning": true,
+      "healthStatus": "imperfect",
+      "latencyMs": 4342
+    }
+  ],
+  "notes": [
+    "Free model availability and rate limits can vary.",
+    "Use openrouter/free if the recommended model is temporarily unavailable."
+  ]
+}

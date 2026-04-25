@@ -1,2 +1,12 @@
 venv
 .python-version
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Local env
+.env

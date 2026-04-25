@@ -1,0 +1,14 @@
+services:
+  proxy:
+    build: .
+    image: free-llm-proxy:dev
+    container_name: free-llm-proxy
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health',timeout=2).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
