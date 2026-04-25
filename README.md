@@ -32,6 +32,10 @@ uvicorn free_llm_proxy.main:app --host 0.0.0.0 --port 8080
 
 ## Использование
 
+### qween code
+
+см [`qween/README.md`](qween/README.md) [`qween/settings.json`](qween/settings.json).
+
 ### curl
 
 ```bash

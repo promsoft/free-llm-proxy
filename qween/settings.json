@@ -1,0 +1,25 @@
+{
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "free-model",
+        "name": "free-model",
+        "baseUrl": "http://localhost:8080/api/v1",
+        "description": "Free model via OR",
+        "envKey": "PROXY_API_KEY"
+      }
+    ]
+  },
+  "env": {
+    "PROXY_API_KEY": "PROXY_API_KEY_VALUE"
+  },
+  "security": {
+    "auth": {
+      "selectedType": "openai"
+    }
+  },
+  "model": {
+    "name": "free-model"
+  },
+  "$version": 3
+}
