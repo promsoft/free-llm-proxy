@@ -26,9 +26,11 @@
   пропуск моделей с активным cooldown.
 - `parse_retry_after(headers)` — секунды, HTTP-date, отсутствие
   заголовка, мусор.
-- `map_upstream_error(exc) -> Outcome` — `openai.RateLimitError` →
-  `rate_limited`, `APITimeoutError` → `error(generic)`, `APIStatusError`
-  с 4xx≠429 → `client_error` (без cooldown, прокидываем клиенту).
+- `classify_exception(exc) -> UpstreamError | None` — `openai.RateLimitError`
+  → `rate_limited`, `APITimeoutError` → `upstream_error`, `APIStatusError`
+  с 5xx → `upstream_error`, с 401/403 → `upstream_auth_error` (без
+  cooldown, отдаём клиенту 502), с прочими 4xx → `client_error` (без
+  cooldown, прокидываем клиенту as-is). `httpx.HTTPError` → `upstream_error`.
 - `Cooldowns` — добавление, проверка `is_cooled_down(now)`, очистка
   записей по моделям, удалённым из нового snapshot.
 - pydantic-схема `Model` — парсинг JSON-фикстуры из `tests/fixtures/`,
@@ -144,7 +146,7 @@ shir-man.com и поэтому может флапать. Цель — пойм�
 
 ```
 tests/
-├── conftest.py                # фикстуры: app, asgi_client, frozen_time, snapshot
+├── conftest.py                # фикстуры: app, client, auth_headers
 ├── fixtures/
 │   └── top-models.json        # один сохранённый ответ shir-man.com,
 │                              # обновляем вручную при изменениях схемы
@@ -152,10 +154,12 @@ tests/
 ├── test_router.py             # select_candidates (табличные)
 ├── test_refresher.py          # удерживаем старый snapshot при сбое
 ├── test_upstream.py           # маппинг ошибок SDK, parse_retry_after
-├── test_api_chat.py           # /v1/chat/completions сценарии
+├── test_api_chat.py           # /v1/chat/completions (non-stream + stream)
 ├── test_api_models.py         # /v1/models
-├── test_api_admin.py          # /admin/refresh
-├── test_api_ops.py            # /health, /ready, /metrics, auth
+├── test_api_ops.py            # /health, /ready, /admin/refresh
+├── test_auth.py               # bearer-аутентификация на всех закрытых эндпоинтах
+├── test_metrics.py            # /metrics — формат и значения gauge'ей
+├── test_skeleton.py           # smoke на app factory / lifespan
 └── test_live.py               # всё под @pytest.mark.live (smoke + schema)
 ```
 
@@ -190,6 +194,5 @@ GitHub Actions, прогон будет `pytest -m "not live"` + ruff;
 - Реальную часовую периодичность обновления (`MODELS_REFRESH_SEC`
   патчим до секунд в тестах refresher'а).
 - Качество / правильность ответов LLM (галлюцинации free-моделей).
-- Streaming (его нет в MVP, см. `spec/§9`).
 - Concurrency cooldown'ов под нагрузкой и нагрузочный профиль —
   отложено; будет смысл, когда появятся первые пользователи.

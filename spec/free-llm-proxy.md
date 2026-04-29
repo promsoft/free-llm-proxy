@@ -91,6 +91,11 @@ HTTP запрос  ──▶   │  FastAPI router              │
 Все эндпоинты, кроме `/health` и `/metrics`, требуют заголовок
 `Authorization: Bearer <PROXY_API_KEY>`.
 
+> Все эндпоинты `/v1/...` (`/chat/completions`, `/models`) дополнительно
+> доступны под префиксом `/api/v1/...` — алиас для клиентов, которые
+> ожидают OpenRouter-style путь (`base_url=https://.../api/v1`). Поведение
+> идентичное.
+
 ### 4.1. `POST /v1/chat/completions`
 - Тело — стандартный OpenAI Chat Completions request.
 - Поле `model` в запросе **игнорируется** (или принимаем магическое значение
@@ -122,8 +127,11 @@ HTTP запрос  ──▶   │  FastAPI router              │
 - Prometheus-формат. Метрики:
   - `freellm_requests_total{status}` — counter,
   - `freellm_request_duration_seconds` — histogram,
-  - `freellm_upstream_attempts_total{model_id, outcome}` — counter
-    (`outcome` ∈ `success | rate_limited | error | filtered_out`),
+  - `freellm_upstream_attempts_total{model_id, outcome}` — counter,
+    где `outcome` — одно из значений `Outcome` enum
+    (`success | rate_limited | upstream_error | upstream_auth_error |
+    client_error`); модели, отсечённые capability-фильтром, в эту
+    метрику не попадают (они даже не пробуются),
   - `freellm_active_models` — gauge размер snapshot,
   - `freellm_cooldown_models` — gauge число моделей в cooldown,
   - `freellm_snapshot_age_seconds` — gauge.
@@ -259,26 +267,37 @@ JSON-логи; для каждого `chat.completions` запроса — од�
 ├── src/
 │   └── free_llm_proxy/
 │       ├── __init__.py
-│       ├── main.py           # FastAPI app factory, lifespan
-│       ├── config.py         # pydantic-settings
-│       ├── models.py         # pydantic-схемы (Model, Snapshot, ChatRequest)
-│       ├── registry.py       # ModelRegistry: snapshot + cooldowns
-│       ├── refresher.py      # фоновая задача обновления
-│       ├── router.py         # выбор модели + fallback
-│       ├── upstream.py       # тонкая обёртка над openai SDK
+│       ├── main.py                # FastAPI app factory, lifespan
+│       ├── config.py              # pydantic-settings
+│       ├── deps.py                # FastAPI-зависимости (get_registry, get_refresher)
+│       ├── models.py              # pydantic-схемы (Model, TopModelsResponse)
+│       ├── registry.py            # ModelRegistry: snapshot + Cooldowns
+│       ├── refresher.py           # фоновая задача обновления
+│       ├── router.py              # select_candidates(): фильтр + fallback-порядок
+│       ├── upstream.py            # обёртка openai.AsyncOpenAI + classify_exception
 │       ├── api/
-│       │   ├── chat.py       # /v1/chat/completions
-│       │   ├── models.py     # /v1/models
-│       │   ├── admin.py      # /admin/refresh
-│       │   └── ops.py        # /health, /ready, /metrics
-│       ├── auth.py           # bearer-зависимость FastAPI
-│       ├── logging.py        # JSON-логгер
-│       └── metrics.py        # prometheus collectors
+│       │   ├── chat.py            # /v1/chat/completions (non-stream + SSE)
+│       │   ├── models_endpoint.py # /v1/models  (имя models.py занято на уровне пакета)
+│       │   ├── admin.py           # /admin/refresh
+│       │   └── ops.py             # /health, /ready, /metrics
+│       ├── auth.py                # bearer-зависимость FastAPI
+│       ├── logging.py             # JSON-логгер
+│       └── metrics.py             # prometheus collectors
 └── tests/
-    ├── test_registry.py      # cooldown-логика, snapshot swap
-    ├── test_router.py        # capability-фильтр, порядок попыток
-    ├── test_refresher.py     # удерживаем старый snapshot при ошибке
-    └── test_api.py           # e2e через httpx ASGI client с замоканным OpenRouter
+    ├── conftest.py                # фикстуры: app, client, auth_headers
+    ├── fixtures/
+    │   └── top-models.json        # сохранённый ответ shir-man.com
+    ├── test_registry.py           # Cooldowns, snapshot swap
+    ├── test_router.py             # select_candidates (табличные)
+    ├── test_refresher.py          # удержание старого snapshot при ошибке
+    ├── test_upstream.py           # маппинг ошибок SDK, parse_retry_after
+    ├── test_api_chat.py           # /v1/chat/completions (non-stream + stream)
+    ├── test_api_models.py         # /v1/models
+    ├── test_api_ops.py            # /health, /ready, /admin/refresh
+    ├── test_auth.py               # bearer-аутентификация
+    ├── test_metrics.py            # /metrics
+    ├── test_skeleton.py           # smoke на app factory
+    └── test_live.py               # @pytest.mark.live — реальный OpenRouter + schema
 ```
 
 ## 9. Не входит в MVP (явные нецели)
@@ -293,6 +312,11 @@ JSON-логи; для каждого `chat.completions` запроса — од�
 > такие клиенты неюзабельны. См. §4.1, §5.6.
 
 ## 10. План реализации (последовательность задач)
+
+> ✅ Выполнено в коммитах `256efd4` → `f4905ac` (MVP, `/api/v1` алиас,
+> диагностика 400/503, streaming, 401/403 → 502 `upstream_auth_error`).
+> Список ниже сохранён как историческая запись о порядке шагов — править
+> его не нужно, актуальное состояние теперь читается из кода и `git log`.
 
 1. **Скелет проекта**: `pyproject.toml` (или фиксация `requirements.in`),
    FastAPI app factory, `/health`, Dockerfile, docker-compose, `.env.example`.
