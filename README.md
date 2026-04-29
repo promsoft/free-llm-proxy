@@ -1,5 +1,7 @@
 # free-llm-proxy
 
+Это код к митапу https://kolodezev.ru/llm-dev.html
+
 OpenAI-совместимый HTTP-прокси, который раз в час подтягивает рейтинг
 бесплатных моделей с
 [shir-man.com/api/free-llm/top-models](https://shir-man.com/api/free-llm/top-models)
