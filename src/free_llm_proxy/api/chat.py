@@ -3,7 +3,7 @@ import json
 import time
 import uuid
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -14,8 +14,9 @@ from openai.types.chat import ChatCompletionChunk
 from ..auth import require_proxy_key
 from ..config import Settings, get_settings
 from ..deps import get_registry
+from ..fallback import AttemptSuccess, apply_cooldown, record_attempt, run_fallback
 from ..logging import get_logger
-from ..metrics import request_duration_seconds, requests_total, upstream_attempts_total
+from ..metrics import request_duration_seconds, requests_total
 from ..registry import Cooldowns, ModelRegistry
 from ..router import select_candidates
 from ..upstream import Outcome, Upstream, UpstreamError, classify_exception
@@ -65,9 +66,6 @@ def _upstream_auth_error_response(exc: UpstreamError, settings: Settings) -> JSO
     )
 
 
-_NO_FALLBACK_OUTCOMES = frozenset({Outcome.CLIENT_ERROR, Outcome.UPSTREAM_AUTH_ERROR})
-
-
 def _terminal_error_response(
     exc: UpstreamError,
     request_id: str,
@@ -114,49 +112,6 @@ def _terminal_error_response(
         )
     requests_total.labels(str(log_status)).inc()
     return response
-
-
-def _cooldown_until(exc: UpstreamError, settings: Settings) -> datetime | None:
-    if exc.outcome is Outcome.RATE_LIMITED:
-        return exc.retry_after or (
-            datetime.now(UTC) + timedelta(seconds=settings.rate_limit_cooldown_sec)
-        )
-    if exc.outcome is Outcome.UPSTREAM_ERROR:
-        return exc.retry_after or (
-            datetime.now(UTC) + timedelta(seconds=settings.generic_error_cooldown_sec)
-        )
-    return None
-
-
-def _record_attempt(
-    attempts: list[dict[str, Any]],
-    *,
-    model_id: str,
-    outcome: Outcome,
-    duration_ms: int,
-    status_code: int | None = None,
-    cooldown_until: datetime | None = None,
-) -> None:
-    upstream_attempts_total.labels(model_id, outcome.value).inc()
-    entry: dict[str, Any] = {
-        "model": model_id,
-        "outcome": outcome.value,
-        "duration_ms": duration_ms,
-    }
-    if status_code is not None:
-        entry["status"] = status_code
-    if cooldown_until is not None:
-        entry["cooldown_until"] = cooldown_until.isoformat()
-    attempts.append(entry)
-
-
-def _apply_cooldown(
-    cooldowns: Cooldowns, model_id: str, exc: UpstreamError, settings: Settings
-) -> datetime | None:
-    until = _cooldown_until(exc, settings)
-    if until is not None:
-        cooldowns.mark(model_id, until)
-    return until
 
 
 @router.post("/chat/completions")
@@ -219,39 +174,18 @@ async def _handle_nonstream(
     request_id: str,
     started: float,
 ):
-    attempts: list[dict[str, Any]] = []
-    terminal_error: UpstreamError | None = None
+    outcome = await run_fallback(
+        candidates,
+        lambda model_id: upstream.chat(model_id, body),
+        cooldowns=registry.cooldowns,
+        settings=settings,
+    )
 
-    for model in candidates:
-        attempt_started = time.perf_counter()
-        try:
-            result = await upstream.chat(model.id, body)
-        except UpstreamError as exc:
-            duration_ms = int((time.perf_counter() - attempt_started) * 1000)
-            if exc.outcome in _NO_FALLBACK_OUTCOMES:
-                _record_attempt(
-                    attempts,
-                    model_id=model.id,
-                    outcome=exc.outcome,
-                    duration_ms=duration_ms,
-                    status_code=exc.status_code,
-                )
-                terminal_error = exc
-                break
-            cooldown_until = _apply_cooldown(registry.cooldowns, model.id, exc, settings)
-            _record_attempt(
-                attempts,
-                model_id=model.id,
-                outcome=exc.outcome,
-                duration_ms=duration_ms,
-                status_code=exc.status_code,
-                cooldown_until=cooldown_until,
-            )
-            continue
-
-        duration_ms = int((time.perf_counter() - attempt_started) * 1000)
-        _record_attempt(
-            attempts, model_id=model.id, outcome=Outcome.SUCCESS, duration_ms=duration_ms
+    if isinstance(outcome, AttemptSuccess):
+        model = outcome.model
+        duration_ms = int((time.perf_counter() - outcome.attempt_started) * 1000)
+        record_attempt(
+            outcome.attempts, model_id=model.id, outcome=Outcome.SUCCESS, duration_ms=duration_ms
         )
         total = time.perf_counter() - started
         request_duration_seconds.observe(total)
@@ -264,19 +198,25 @@ async def _handle_nonstream(
                 "status": 200,
                 "chosen_model": model.id,
                 "stream": False,
-                "attempts": attempts,
+                "attempts": outcome.attempts,
                 "had_tools": bool(body.get("tools")),
                 "had_response_format": bool(body.get("response_format")),
             },
         )
-        return JSONResponse(result, headers={"x-free-llm-proxy-model": model.id})
+        return JSONResponse(outcome.result, headers={"x-free-llm-proxy-model": model.id})
 
     total = time.perf_counter() - started
     request_duration_seconds.observe(total)
 
-    if terminal_error is not None:
+    if outcome.terminal_error is not None:
         return _terminal_error_response(
-            terminal_error, request_id, total, attempts, body, settings, stream=False
+            outcome.terminal_error,
+            request_id,
+            total,
+            outcome.attempts,
+            body,
+            settings,
+            stream=False,
         )
 
     requests_total.labels("503").inc()
@@ -288,7 +228,7 @@ async def _handle_nonstream(
             "status": 503,
             "chosen_model": None,
             "stream": False,
-            "attempts": attempts,
+            "attempts": outcome.attempts,
             "had_tools": bool(body.get("tools")),
             "had_response_format": bool(body.get("response_format")),
         },
@@ -306,43 +246,22 @@ async def _handle_stream(
     request_id: str,
     started: float,
 ):
-    attempts: list[dict[str, Any]] = []
-    terminal_error: UpstreamError | None = None
+    outcome = await run_fallback(
+        candidates,
+        lambda model_id: upstream.chat_stream(model_id, body),
+        cooldowns=registry.cooldowns,
+        settings=settings,
+    )
 
-    for model in candidates:
-        attempt_started = time.perf_counter()
-        try:
-            stream = await upstream.chat_stream(model.id, body)
-        except UpstreamError as exc:
-            duration_ms = int((time.perf_counter() - attempt_started) * 1000)
-            if exc.outcome in _NO_FALLBACK_OUTCOMES:
-                _record_attempt(
-                    attempts,
-                    model_id=model.id,
-                    outcome=exc.outcome,
-                    duration_ms=duration_ms,
-                    status_code=exc.status_code,
-                )
-                terminal_error = exc
-                break
-            cooldown_until = _apply_cooldown(registry.cooldowns, model.id, exc, settings)
-            _record_attempt(
-                attempts,
-                model_id=model.id,
-                outcome=exc.outcome,
-                duration_ms=duration_ms,
-                status_code=exc.status_code,
-                cooldown_until=cooldown_until,
-            )
-            continue
-
+    if isinstance(outcome, AttemptSuccess):
+        model = outcome.model
         # We have a live SSE connection — commit and return StreamingResponse.
         return StreamingResponse(
             _emit_sse(
-                stream,
+                outcome.result,
                 model_id=model.id,
-                attempts=attempts,
-                attempt_started=attempt_started,
+                attempts=outcome.attempts,
+                attempt_started=outcome.attempt_started,
                 request_id=request_id,
                 started=started,
                 body=body,
@@ -360,9 +279,9 @@ async def _handle_stream(
     total = time.perf_counter() - started
     request_duration_seconds.observe(total)
 
-    if terminal_error is not None:
+    if outcome.terminal_error is not None:
         return _terminal_error_response(
-            terminal_error, request_id, total, attempts, body, settings, stream=True
+            outcome.terminal_error, request_id, total, outcome.attempts, body, settings, stream=True
         )
 
     requests_total.labels("503").inc()
@@ -374,7 +293,7 @@ async def _handle_stream(
             "status": 503,
             "chosen_model": None,
             "stream": True,
-            "attempts": attempts,
+            "attempts": outcome.attempts,
             "had_tools": bool(body.get("tools")),
             "had_response_format": bool(body.get("response_format")),
         },
@@ -414,7 +333,7 @@ async def _emit_sse(
         )
         # No fallback once chunks have started — emit error event in-band.
         # Still mark cooldown so the model gets a rest on the next request.
-        _apply_cooldown(cooldowns, model_id, mid_error, settings)
+        apply_cooldown(cooldowns, model_id, mid_error, settings)
         yield _sse_data(
             {
                 "error": {
@@ -432,7 +351,7 @@ async def _emit_sse(
 
     duration_ms = int((time.perf_counter() - attempt_started) * 1000)
     outcome = Outcome.SUCCESS if mid_error is None else mid_error.outcome
-    _record_attempt(
+    record_attempt(
         attempts,
         model_id=model_id,
         outcome=outcome,
