@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     openrouter_referer: str = "https://github.com/promsoft/free-llm-proxy"
     openrouter_title: str = "free-llm-proxy"
 
+    # Anthropic Messages API shim (/api/anthropic). See spec/anthropic.md.
+    anthropic_api_enabled: bool = True
+    anthropic_tokens_per_char_divisor: float = 4.0
+
 
 _settings: Settings | None = None
 

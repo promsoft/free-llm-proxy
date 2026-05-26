@@ -45,6 +45,26 @@ def test_smoke_three_consecutive_calls(proxy_key: str):
     print("Models used:", seen_models)
 
 
+def test_smoke_anthropic_messages(proxy_key: str):
+    """Claude Code / anthropic SDK path: POST /api/anthropic/v1/messages."""
+    with httpx.Client(timeout=60.0) as c:
+        r = c.post(
+            f"{PROXY_URL}/api/anthropic/v1/messages",
+            headers={"x-api-key": proxy_key, "anthropic-version": "2023-06-01"},
+            json={
+                "model": "claude-3-5-sonnet",
+                "max_tokens": 256,
+                "messages": [{"role": "user", "content": PROMPT}],
+            },
+        )
+        assert r.status_code == 200, r.text
+        assert "x-free-llm-proxy-model" in r.headers
+        body = r.json()
+        assert body["type"] == "message"
+        text = "".join(b.get("text", "") for b in body["content"] if b.get("type") == "text")
+        assert text.strip() != ""
+
+
 def test_schema_real_shir_man_response_parses():
     r = httpx.get(SHIR_MAN_URL, timeout=30.0)
     assert r.status_code == 200

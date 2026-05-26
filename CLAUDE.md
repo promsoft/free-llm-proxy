@@ -4,9 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Источник истины — **`spec/free-llm-proxy.md`**. Перед любым изменением кода сверяйся с
 этим документом: там зафиксированы архитектура, контракт API, поведение
-fallback, переменные окружения и структура репозитория. Стратегия
-тестирования — в **`spec/verification.md`**. Спецификация написана на
-русском; общение с пользователем тоже на русском.
+fallback, переменные окружения и структура репозитория. Anthropic
+Messages API (`/api/anthropic`) специфицирован отдельно в
+**`spec/anthropic.md`**. Стратегия тестирования — в
+**`spec/verification.md`**. Спецификация написана на русском; общение с
+пользователем тоже на русском.
 
 ## Что строим (TL;DR — детали в spec)
 
@@ -36,6 +38,10 @@ OpenAI-совместимый HTTP-прокси, который:
 6. **`/api/v1/...` — алиас к `/v1/...`** (для клиентов, которые ждут
    OpenRouter-style путь). Зарегистрирован двойной `include_router` в
    `main.py`.
+7. **Anthropic Messages API под `/api/anthropic`** (для Claude Code /
+   `anthropic` SDK) — трансляционный шим Anthropic↔OpenAI поверх того же
+   конвейера. Детали и нецели — `spec/anthropic.md`. OpenRouter нативного
+   Anthropic-API не имеет, поэтому всё транслируется в OpenAI и обратно.
 
 Ключевые компоненты в `src/free_llm_proxy/`:
 - `registry.py` — in-memory snapshot моделей + таблица cooldown'ов.
@@ -45,8 +51,16 @@ OpenAI-совместимый HTTP-прокси, который:
   `classify_exception()` мапит ошибки SDK (`RateLimitError`,
   `APITimeoutError`, `APIStatusError`) в `Outcome`-категории и парсит
   заголовки rate-limit.
+- `fallback.py` — общее ядро цикла попыток (`run_fallback`,
+  `apply_cooldown`, `record_attempt`), переиспользуется OpenAI- и
+  Anthropic-эндпоинтами.
+- `anthropic_translate.py` — чистый перевод Anthropic↔OpenAI
+  (`anthropic_to_openai_request`, `openai_to_anthropic_response`,
+  `AnthropicStreamTranslator`, `estimate_input_tokens`, `AnthropicError`).
 - `api/` — FastAPI-роутеры по эндпоинтам (`chat.py`, `models_endpoint.py`,
-  `admin.py`, `ops.py`).
+  `admin.py`, `ops.py`, `anthropic.py`).
+- `auth.py` — `require_proxy_key` (Bearer) и `require_anthropic_key`
+  (x-api-key / Bearer, ошибки в Anthropic-формате).
 - `deps.py` — FastAPI-зависимости `get_registry` / `get_refresher`.
 
 ## Намеренные нецели (не реализовывать без явного запроса)

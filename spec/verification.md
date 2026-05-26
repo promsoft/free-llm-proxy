@@ -160,8 +160,17 @@ tests/
 ├── test_auth.py               # bearer-аутентификация на всех закрытых эндпоинтах
 ├── test_metrics.py            # /metrics — формат и значения gauge'ей
 ├── test_skeleton.py           # smoke на app factory / lifespan
+├── test_anthropic_translate.py # перевод Anthropic↔OpenAI (чистые функции)
+├── test_anthropic_stream.py   # AnthropicStreamTranslator (события SSE)
+├── test_api_anthropic.py      # /api/anthropic/v1/messages (+ count_tokens)
+├── test_anthropic_auth.py     # x-api-key / Bearer на Anthropic-эндпоинте
 └── test_live.py               # всё под @pytest.mark.live (smoke + schema)
 ```
+
+**Anthropic Messages API** (`/api/anthropic`) тестируется по отдельному
+плану — см. `spec/anthropic.md §13`. Общее ядро fallback вынесено в
+`fallback.py` (рефакторинг из `api/chat.py`) и покрывается косвенно
+через `test_api_chat.py` и `test_api_anthropic.py`.
 
 `tests/fixtures/top-models.json` — реальный ответ shir-man.com,
 сохранённый один раз. Это базовый snapshot для unit/component/E2E.

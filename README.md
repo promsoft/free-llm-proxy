@@ -9,7 +9,13 @@ OpenAI-совместимый HTTP-прокси, который раз в час
 [OpenRouter](https://openrouter.ai/api/v1) с capability-фильтром и
 fallback по rank.
 
-Полная спецификация: [`spec/free-llm-proxy.md`](spec/free-llm-proxy.md).
+Поддерживает два протокола поверх одного и того же пула моделей:
+**OpenAI Chat Completions** (`/v1/...`) и **Anthropic Messages API**
+(`/api/anthropic/...`) — последний позволяет подключать Claude Code и
+`anthropic` SDK.
+
+Полная спецификация: [`spec/free-llm-proxy.md`](spec/free-llm-proxy.md),
+Anthropic-эндпоинт: [`spec/anthropic.md`](spec/anthropic.md).
 Стратегия тестирования: [`spec/verification.md`](spec/verification.md).
 
 ## Quick start
@@ -66,12 +72,30 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
+### Claude Code
+
+Прокси выставляет Anthropic Messages API под префиксом `/api/anthropic`.
+Указываем его как базовый URL — Claude Code сам допишет `/v1/messages`:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8080/api/anthropic
+export ANTHROPIC_AUTH_TOKEN=local-dev-key   # это PROXY_API_KEY
+# (вместо ANTHROPIC_AUTH_TOKEN можно ANTHROPIC_API_KEY — уйдёт в x-api-key)
+claude
+```
+
+`ANTHROPIC_MODEL` / `ANTHROPIC_SMALL_FAST_MODEL` игнорируются — модель
+выбирается по rank. Подробности перевода и ограничения — в
+[`spec/anthropic.md`](spec/anthropic.md).
+
 ## Эндпоинты
 
 | Метод | Путь                     | Auth   | Назначение                                    |
 |-------|--------------------------|--------|-----------------------------------------------|
-| POST  | `/v1/chat/completions`   | Bearer | OpenAI-совместимый chat (без stream)          |
+| POST  | `/v1/chat/completions`   | Bearer | OpenAI-совместимый chat (stream + non-stream) |
 | GET   | `/v1/models`             | Bearer | Текущий snapshot моделей в OpenAI-формате     |
+| POST  | `/api/anthropic/v1/messages` | x-api-key / Bearer | Anthropic Messages API (stream + non-stream) |
+| POST  | `/api/anthropic/v1/messages/count_tokens` | x-api-key / Bearer | Приблизительная оценка `input_tokens` |
 
 `/v1/...` и `/api/v1/...` работают одинаково — алиас для клиентов,
 которые ожидают OpenRouter-style путь (`base_url=.../api/v1`).
@@ -92,6 +116,10 @@ print(resp.choices[0].message.content)
 - **5xx / timeout** → cooldown 60 c → следующая.
 - **4xx (кроме 429)** → проброс клиенту, fallback не триггерится.
 - Лимит — 5 попыток на запрос, 30 с на upstream.
+- **Anthropic-эндпоинт** (`/api/anthropic`) использует тот же выбор
+  модели, fallback и cooldown; запрос/ответ транслируются Anthropic↔OpenAI,
+  стриминг отдаётся событиями Anthropic SSE (`message_start` …
+  `message_stop`), ошибки — в Anthropic-формате `{"type":"error",...}`.
 
 ## Разработка
 

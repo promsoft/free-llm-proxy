@@ -1,13 +1,19 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
-from .api import admin, chat, models_endpoint, ops
+from .anthropic_translate import AnthropicError
+from .api import admin, anthropic, chat, models_endpoint, ops
 from .config import Settings, get_settings
 from .logging import configure_logging
 from .refresher import Refresher
 from .registry import ModelRegistry
 from .upstream import Upstream
+
+
+async def _anthropic_error_handler(request: Request, exc: AnthropicError) -> JSONResponse:
+    return JSONResponse(exc.body(), status_code=exc.status_code)
 
 
 @asynccontextmanager
@@ -41,6 +47,10 @@ def create_app(settings: Settings | None = None, *, auto_start_refresher: bool =
     # OpenRouter-style alias: many OpenAI-compatible clients append /api/v1.
     app.include_router(chat.router, prefix="/api")
     app.include_router(models_endpoint.router, prefix="/api")
+    # Anthropic Messages API shim (for Claude Code / anthropic SDK).
+    if settings.anthropic_api_enabled:
+        app.include_router(anthropic.router, prefix="/api/anthropic")
+        app.add_exception_handler(AnthropicError, _anthropic_error_handler)
     return app
 
 
