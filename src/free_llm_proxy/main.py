@@ -28,8 +28,7 @@ async def lifespan(app: FastAPI):
     finally:
         await refresher.stop()
         await upstream.aclose()
-        if app.state.openrouter_proxy_client is not None:
-            await app.state.openrouter_proxy_client.aclose()
+        await app.state.openrouter_proxy_client.aclose()
 
 
 def create_app(settings: Settings | None = None, *, auto_start_refresher: bool = True) -> FastAPI:
@@ -55,12 +54,11 @@ def create_app(settings: Settings | None = None, *, auto_start_refresher: bool =
         app.include_router(anthropic.router, prefix="/api/anthropic")
         app.add_exception_handler(AnthropicError, _anthropic_error_handler)
     # OpenRouter passthrough: client-named model, raw byte relay.
-    app.state.openrouter_proxy_client = None
+    app.state.openrouter_proxy_client = httpx.AsyncClient(
+        base_url=settings.openrouter_proxy_base,
+        timeout=settings.openrouter_proxy_timeout_sec,
+    )
     if settings.openrouter_proxy_enabled:
-        app.state.openrouter_proxy_client = httpx.AsyncClient(
-            base_url=settings.openrouter_proxy_base,
-            timeout=settings.openrouter_proxy_timeout_sec,
-        )
         app.include_router(openrouter.router, prefix="/api/openrouter")
     return app
 

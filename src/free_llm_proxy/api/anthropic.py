@@ -32,18 +32,17 @@ from ..logging import get_logger
 from ..metrics import request_duration_seconds, requests_total
 from ..registry import Cooldowns, ModelRegistry
 from ..router import select_candidates
-from ..upstream import Outcome, Upstream, UpstreamError, classify_exception
+from ..upstream import (
+    Outcome,
+    Upstream,
+    UpstreamError,
+    classify_exception,
+    key_tail,
+    upstream_auth_error_message,
+)
 
 router = APIRouter(prefix="/v1", tags=["anthropic"], dependencies=[Depends(require_anthropic_key)])
 log = get_logger(__name__)
-
-
-def _key_tail(key: str) -> str:
-    if not key:
-        return "(empty)"
-    if len(key) <= 4:
-        return f"len={len(key)}"
-    return f"...{key[-4:]} (len={len(key)})"
 
 
 def _anthropic_type_for_status(status_code: int) -> str:
@@ -111,12 +110,9 @@ def _terminal_error_response(
 ) -> JSONResponse:
     if exc.outcome is Outcome.UPSTREAM_AUTH_ERROR:
         status_code = 502
-        message = (
-            f"Proxy could not authenticate with upstream (HTTP {exc.status_code}). "
-            f"Check OPENROUTER_API_KEY: current key tail is "
-            f"{_key_tail(settings.openrouter_api_key)}."
+        err = AnthropicError(
+            status_code, "api_error", upstream_auth_error_message(exc.status_code, settings)
         )
-        err = AnthropicError(status_code, "api_error", message)
         _log_done(
             request_id,
             total,
@@ -128,7 +124,7 @@ def _terminal_error_response(
             level="error",
             extra={
                 "reason": "upstream_auth_error",
-                "key_tail": _key_tail(settings.openrouter_api_key),
+                "key_tail": key_tail(settings.openrouter_api_key),
             },
         )
     else:

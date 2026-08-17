@@ -7,7 +7,7 @@ model, the proxy swaps in OPENROUTER_API_KEY and relays bytes verbatim.
 import json
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 
 import httpx
 from fastapi import APIRouter, Depends, Request
@@ -15,20 +15,22 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..auth import require_proxy_key
 from ..config import Settings, get_settings
+from ..deps import get_openrouter_client
 from ..logging import get_logger
 from ..metrics import openrouter_proxy_requests_total
-from .chat import _key_tail
+from ..upstream import upstream_auth_error_body
 
 router = APIRouter(tags=["openrouter"], dependencies=[Depends(require_proxy_key)])
 log = get_logger(__name__)
 
+_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+
 # Key/account management stays private to the proxy operator (spec §2.1).
-_BLOCKED_PREFIXES: tuple[tuple[str, ...], ...] = (
-    ("api", "v1", "key"),
-    ("api", "v1", "keys"),
-    ("api", "v1", "credits"),
-    ("api", "v1", "auth"),
-)
+_BLOCKED_SEGMENTS = {"key", "keys", "credits", "auth"}
+
+# Request bodies above this size are relayed without buffering (and without
+# best-effort `model` extraction for the log).
+_BUFFER_LIMIT = 64 * 1024
 
 _HOP_BY_HOP = {
     "connection",
@@ -46,10 +48,10 @@ _HOP_BY_HOP = {
 
 def _is_blocked(tail: str) -> bool:
     segments = tuple(s.lower() for s in tail.split("/") if s)
-    return any(segments[: len(p)] == p for p in _BLOCKED_PREFIXES)
+    return segments[:2] == ("api", "v1") and len(segments) > 2 and segments[2] in _BLOCKED_SEGMENTS
 
 
-def _build_upstream_headers(incoming: httpx.Headers | dict, settings: Settings) -> dict[str, str]:
+def _build_upstream_headers(incoming: Mapping[str, str], settings: Settings) -> dict[str, str]:
     headers = {
         "Authorization": f"Bearer {settings.openrouter_api_key}",
         "HTTP-Referer": settings.openrouter_referer,
@@ -76,17 +78,21 @@ def _requested_model(body: bytes, content_type: str | None) -> str | None:
         return None
     try:
         data = json.loads(body)
-    except (ValueError, UnicodeDecodeError):
+    except ValueError:
         return None
     model = data.get("model") if isinstance(data, dict) else None
     return model if isinstance(model, str) else None
+
+
+def _error_json(code: str, message: str, status: int) -> JSONResponse:
+    return JSONResponse({"error": {"code": code, "message": message}}, status_code=status)
 
 
 def _finish(
     request_id: str,
     method: str,
     tail: str,
-    status: int | str,
+    status: int,
     started: float,
     requested_model: str | None,
 ) -> None:
@@ -105,77 +111,68 @@ def _finish(
     )
 
 
-@router.api_route(
-    "/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
-)
+@router.api_route("/v1/{path:path}", methods=_METHODS)
+async def passthrough_v1_alias(
+    path: str,
+    request: Request,
+    settings: Settings = Depends(get_settings),
+    client: httpx.AsyncClient = Depends(get_openrouter_client),
+):
+    """Alias for OpenAI-SDK clients using base_url=.../api/openrouter/v1 (spec §2)."""
+    return await passthrough(f"api/v1/{path}", request, settings, client)
+
+
+@router.api_route("/{path:path}", methods=_METHODS)
 async def passthrough(
     path: str,
     request: Request,
     settings: Settings = Depends(get_settings),
+    client: httpx.AsyncClient = Depends(get_openrouter_client),
 ):
     started = time.perf_counter()
     request_id = uuid.uuid4().hex
     method = request.method
-
     tail = path.lstrip("/")
-    # Alias for OpenAI-SDK clients using base_url=.../api/openrouter/v1 (spec §2).
-    if tail == "v1" or tail.startswith("v1/"):
-        tail = f"api/{tail}"
 
     if _is_blocked(tail):
         _finish(request_id, method, tail, 403, started, None)
-        return JSONResponse(
-            {
-                "error": {
-                    "code": "forbidden_path",
-                    "message": "This OpenRouter path is not exposed via the proxy.",
-                }
-            },
-            status_code=403,
+        return _error_json(
+            "forbidden_path", "This OpenRouter path is not exposed via the proxy.", 403
         )
 
-    body = await request.body()
-    requested_model = _requested_model(body, request.headers.get("content-type"))
-    client: httpx.AsyncClient = request.app.state.openrouter_proxy_client
+    try:
+        content_length = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        content_length = 0
+    headers = _build_upstream_headers(request.headers, settings)
+    requested_model: str | None = None
+    if content_length > _BUFFER_LIMIT:
+        # Relay large uploads without buffering; keep the exact framing.
+        content: bytes | AsyncIterator[bytes] = request.stream()
+        headers["Content-Length"] = str(content_length)
+    else:
+        content = await request.body()
+        requested_model = _requested_model(content, request.headers.get("content-type"))
     upstream_request = client.build_request(
         method,
         f"/{tail}",
         params=request.url.query or None,
-        content=body,
-        headers=_build_upstream_headers(request.headers, settings),
+        content=content,
+        headers=headers,
     )
 
     try:
         upstream_response = await client.send(upstream_request, stream=True)
     except httpx.HTTPError as exc:
         _finish(request_id, method, tail, 502, started, requested_model)
-        return JSONResponse(
-            {
-                "error": {
-                    "code": "upstream_unreachable",
-                    "message": f"Could not reach OpenRouter: {exc}",
-                }
-            },
-            status_code=502,
-        )
+        return _error_json("upstream_unreachable", f"Could not reach OpenRouter: {exc}", 502)
 
     if upstream_response.status_code in (401, 403):
         # Bad OPENROUTER_API_KEY, not a client mistake (spec §5).
         await upstream_response.aclose()
         _finish(request_id, method, tail, 502, started, requested_model)
         return JSONResponse(
-            {
-                "error": {
-                    "code": "upstream_auth_error",
-                    "message": (
-                        f"Proxy could not authenticate with upstream "
-                        f"(HTTP {upstream_response.status_code}). Check OPENROUTER_API_KEY: "
-                        f"current key tail is {_key_tail(settings.openrouter_api_key)}."
-                    ),
-                    "type": "proxy_misconfiguration",
-                }
-            },
-            status_code=502,
+            upstream_auth_error_body(upstream_response.status_code, settings), status_code=502
         )
 
     status = upstream_response.status_code

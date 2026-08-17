@@ -66,6 +66,33 @@ def parse_retry_after(headers: httpx.Headers | dict[str, str], now: datetime) ->
     return None
 
 
+def key_tail(key: str) -> str:
+    if not key:
+        return "(empty)"
+    if len(key) <= 4:
+        return f"len={len(key)}"
+    return f"...{key[-4:]} (len={len(key)})"
+
+
+def upstream_auth_error_message(status_code: int | None, settings: Settings) -> str:
+    """401/403 from OpenRouter means our OPENROUTER_API_KEY is bad, not the client's."""
+    return (
+        f"Proxy could not authenticate with upstream (HTTP {status_code}). "
+        f"Check OPENROUTER_API_KEY: current key tail is "
+        f"{key_tail(settings.openrouter_api_key)}."
+    )
+
+
+def upstream_auth_error_body(status_code: int | None, settings: Settings) -> dict[str, Any]:
+    return {
+        "error": {
+            "code": "upstream_auth_error",
+            "message": upstream_auth_error_message(status_code, settings),
+            "type": "proxy_misconfiguration",
+        }
+    }
+
+
 def classify_exception(exc: BaseException) -> UpstreamError | None:
     """Map openai SDK / httpx exceptions to UpstreamError. Returns None if unknown."""
     if isinstance(exc, RateLimitError):

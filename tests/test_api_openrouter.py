@@ -6,7 +6,7 @@ import httpx
 import pytest
 import respx
 
-from free_llm_proxy.config import reset_settings_cache
+from free_llm_proxy.config import Settings
 from free_llm_proxy.main import create_app
 
 BASE = "https://openrouter.ai"
@@ -160,10 +160,9 @@ async def test_blocklist_matches_segments_not_substrings(client, auth_headers):
     assert route.called
 
 
-async def test_disabled_flag_returns_404(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_PROXY_ENABLED", "false")
-    reset_settings_cache()
-    app = create_app(auto_start_refresher=False)
+async def test_disabled_flag_returns_404():
+    settings = Settings(openrouter_proxy_enabled=False)
+    app = create_app(settings, auto_start_refresher=False)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as c:

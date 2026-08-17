@@ -19,7 +19,14 @@ from ..logging import get_logger
 from ..metrics import request_duration_seconds, requests_total
 from ..registry import Cooldowns, ModelRegistry
 from ..router import select_candidates
-from ..upstream import Outcome, Upstream, UpstreamError, classify_exception
+from ..upstream import (
+    Outcome,
+    Upstream,
+    UpstreamError,
+    classify_exception,
+    key_tail,
+    upstream_auth_error_body,
+)
 
 router = APIRouter(prefix="/v1", tags=["chat"], dependencies=[Depends(require_proxy_key)])
 log = get_logger(__name__)
@@ -40,30 +47,8 @@ def _passthrough_client_error(exc: UpstreamError) -> JSONResponse:
     return JSONResponse(body, status_code=status)
 
 
-def _key_tail(key: str) -> str:
-    if not key:
-        return "(empty)"
-    if len(key) <= 4:
-        return f"len={len(key)}"
-    return f"...{key[-4:]} (len={len(key)})"
-
-
 def _upstream_auth_error_response(exc: UpstreamError, settings: Settings) -> JSONResponse:
-    """401/403 from upstream means our OPENROUTER_API_KEY is bad. Return 502."""
-    return JSONResponse(
-        {
-            "error": {
-                "code": "upstream_auth_error",
-                "message": (
-                    f"Proxy could not authenticate with upstream "
-                    f"(HTTP {exc.status_code}). Check OPENROUTER_API_KEY: "
-                    f"current key tail is {_key_tail(settings.openrouter_api_key)}."
-                ),
-                "type": "proxy_misconfiguration",
-            }
-        },
-        status_code=502,
-    )
+    return JSONResponse(upstream_auth_error_body(exc.status_code, settings), status_code=502)
 
 
 def _terminal_error_response(
@@ -91,7 +76,7 @@ def _terminal_error_response(
                 "had_tools": bool(body.get("tools")),
                 "had_response_format": bool(body.get("response_format")),
                 "reason": "upstream_auth_error",
-                "key_tail": _key_tail(settings.openrouter_api_key),
+                "key_tail": key_tail(settings.openrouter_api_key),
             },
         )
     else:

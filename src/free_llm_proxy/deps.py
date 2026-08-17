@@ -1,3 +1,4 @@
+import httpx
 from fastapi import Request
 
 from .refresher import Refresher
@@ -10,3 +11,7 @@ def get_registry(request: Request) -> ModelRegistry:
 
 def get_refresher(request: Request) -> Refresher:
     return request.app.state.refresher
+
+
+def get_openrouter_client(request: Request) -> httpx.AsyncClient:
+    return request.app.state.openrouter_proxy_client
