@@ -9,13 +9,18 @@ OpenAI-совместимый HTTP-прокси, который раз в час
 [OpenRouter](https://openrouter.ai/api/v1) с capability-фильтром и
 fallback по rank.
 
-Поддерживает два протокола поверх одного и того же пула моделей:
-**OpenAI Chat Completions** (`/v1/...`) и **Anthropic Messages API**
-(`/api/anthropic/...`) — последний позволяет подключать Claude Code и
-`anthropic` SDK.
+Три входа поверх одного `OPENROUTER_API_KEY`:
+
+- **OpenAI Chat Completions** (`/v1/...`) — модель выбирает прокси
+  (rank + capability + fallback);
+- **Anthropic Messages API** (`/api/anthropic/...`) — то же самое для
+  Claude Code и `anthropic` SDK;
+- **OpenRouter passthrough** (`/api/openrouter/...`) — прозрачный
+  прокси в OpenRouter: модель называет клиент, fallback не участвует.
 
 Полная спецификация: [`spec/free-llm-proxy.md`](spec/free-llm-proxy.md),
-Anthropic-эндпоинт: [`spec/anthropic.md`](spec/anthropic.md).
+Anthropic-эндпоинт: [`spec/anthropic.md`](spec/anthropic.md),
+passthrough: [`spec/openrouter.md`](spec/openrouter.md).
 Стратегия тестирования: [`spec/verification.md`](spec/verification.md).
 
 ## Quick start
@@ -88,6 +93,37 @@ claude
 выбирается по rank. Подробности перевода и ограничения — в
 [`spec/anthropic.md`](spec/anthropic.md).
 
+### OpenRouter passthrough (конкретная модель)
+
+Когда нужна **конкретная** модель (в т.ч. платная — кредиты спишутся с
+`OPENROUTER_API_KEY`), а не «лучшая бесплатная по rank»:
+
+```bash
+curl -s http://localhost:8080/api/openrouter/api/v1/chat/completions \
+  -H "Authorization: Bearer $PROXY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "qwen/qwen3-coder:free", "messages": [{"role": "user", "content": "Привет"}]}'
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/api/openrouter/api/v1",  # или .../api/openrouter/v1
+    api_key="local-dev-key",  # это PROXY_API_KEY
+)
+resp = client.chat.completions.create(
+    model="qwen/qwen3-coder:free",  # модель обязательна и уходит в OpenRouter как есть
+    messages=[{"role": "user", "content": "Привет"}],
+)
+```
+
+Проксируются все пути OpenRouter (`/models`, `/generation`, стриминг —
+байт-в-байт), кроме провизионных: `api/v1/key(s)`, `api/v1/credits`,
+`api/v1/auth` отвечают `403 forbidden_path`. Ошибки OpenRouter (включая
+`429`) уходят клиенту как есть и не влияют на cooldown'ы
+fallback-конвейера. Детали — [`spec/openrouter.md`](spec/openrouter.md).
+
 ## Эндпоинты
 
 | Метод | Путь                     | Auth   | Назначение                                    |
@@ -96,14 +132,14 @@ claude
 | GET   | `/v1/models`             | Bearer | Текущий snapshot моделей в OpenAI-формате     |
 | POST  | `/api/anthropic/v1/messages` | x-api-key / Bearer | Anthropic Messages API (stream + non-stream) |
 | POST  | `/api/anthropic/v1/messages/count_tokens` | x-api-key / Bearer | Приблизительная оценка `input_tokens` |
-
-`/v1/...` и `/api/v1/...` работают одинаково — алиас для клиентов,
-которые ожидают OpenRouter-style путь (`base_url=.../api/v1`).
-
+| любой | `/api/openrouter/...`    | Bearer | Прозрачный passthrough в OpenRouter (модель называет клиент) |
 | POST  | `/admin/refresh`         | Bearer | Принудительно перечитать список + сбросить cooldowns |
 | GET   | `/health`                | —      | `{"status": "ok"}` пока процесс жив           |
 | GET   | `/ready`                 | —      | 200 если есть свободная модель, 503 иначе     |
 | GET   | `/metrics`               | —      | Prometheus-метрики                            |
+
+`/v1/...` и `/api/v1/...` работают одинаково — алиас для клиентов,
+которые ожидают OpenRouter-style путь (`base_url=.../api/v1`).
 
 ## Поведение
 
@@ -120,6 +156,12 @@ claude
   модели, fallback и cooldown; запрос/ответ транслируются Anthropic↔OpenAI,
   стриминг отдаётся событиями Anthropic SSE (`message_start` …
   `message_stop`), ошибки — в Anthropic-формате `{"type":"error",...}`.
+- **Passthrough-эндпоинт** (`/api/openrouter`) ничего из этого не делает:
+  тело и заголовки уходят в OpenRouter байт-в-байт с подменой ключа,
+  ошибки возвращаются как есть (кроме `401/403` от OpenRouter — они
+  означают плохой `OPENROUTER_API_KEY` и отдаются как
+  `502 upstream_auth_error`). Таймаут свой — 120 с
+  (`OPENROUTER_PROXY_TIMEOUT_SEC`).
 
 ## Разработка
 

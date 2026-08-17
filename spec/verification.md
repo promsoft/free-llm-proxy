@@ -164,11 +164,13 @@ tests/
 ├── test_anthropic_stream.py   # AnthropicStreamTranslator (события SSE)
 ├── test_api_anthropic.py      # /api/anthropic/v1/messages (+ count_tokens)
 ├── test_anthropic_auth.py     # x-api-key / Bearer на Anthropic-эндпоинте
+├── test_api_openrouter.py     # /api/openrouter — passthrough, блоклист, изоляция cooldown
 └── test_live.py               # всё под @pytest.mark.live (smoke + schema)
 ```
 
 **Anthropic Messages API** (`/api/anthropic`) тестируется по отдельному
-плану — см. `spec/anthropic.md §13`. Общее ядро fallback вынесено в
+плану — см. `spec/anthropic.md §13`. **OpenRouter passthrough**
+(`/api/openrouter`) — по `spec/openrouter.md §10`. Общее ядро fallback вынесено в
 `fallback.py` (рефакторинг из `api/chat.py`) и покрывается косвенно
 через `test_api_chat.py` и `test_api_anthropic.py`.
 
