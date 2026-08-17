@@ -42,6 +42,12 @@ OpenAI-совместимый HTTP-прокси, который:
    `anthropic` SDK) — трансляционный шим Anthropic↔OpenAI поверх того же
    конвейера. Детали и нецели — `spec/anthropic.md`. OpenRouter нативного
    Anthropic-API не имеет, поэтому всё транслируется в OpenAI и обратно.
+8. **OpenRouter passthrough под `/api/openrouter`** (`spec/openrouter.md`) —
+   прозрачный raw-прокси всех путей OpenRouter: модель называет клиент,
+   fallback/cooldown/registry не участвуют, `OPENROUTER_API_KEY`
+   подставляется прокси. Провизионные пути (`api/v1/key(s)`, `credits`,
+   `auth`) режутся `403 forbidden_path`; `401/403` от OpenRouter →
+   `502 upstream_auth_error` (как в fallback-конвейере).
 
 Ключевые компоненты в `src/free_llm_proxy/`:
 - `registry.py` — in-memory snapshot моделей + таблица cooldown'ов.
@@ -58,7 +64,7 @@ OpenAI-совместимый HTTP-прокси, который:
   (`anthropic_to_openai_request`, `openai_to_anthropic_response`,
   `AnthropicStreamTranslator`, `estimate_input_tokens`, `AnthropicError`).
 - `api/` — FastAPI-роутеры по эндпоинтам (`chat.py`, `models_endpoint.py`,
-  `admin.py`, `ops.py`, `anthropic.py`).
+  `admin.py`, `ops.py`, `anthropic.py`, `openrouter.py` — passthrough).
 - `auth.py` — `require_proxy_key` (Bearer) и `require_anthropic_key`
   (x-api-key / Bearer, ошибки в Anthropic-формате).
 - `deps.py` — FastAPI-зависимости `get_registry` / `get_refresher`.

@@ -65,6 +65,27 @@ def test_smoke_anthropic_messages(proxy_key: str):
         assert text.strip() != ""
 
 
+def test_smoke_openrouter_passthrough(proxy_key: str):
+    """Passthrough path: клиент сам называет модель (только :free в live)."""
+    with httpx.Client(timeout=60.0) as c:
+        models = c.get(
+            f"{PROXY_URL}/v1/models",
+            headers={"Authorization": f"Bearer {proxy_key}"},
+        )
+        assert models.status_code == 200, models.text
+        model_id = models.json()["data"][0]["id"]
+        assert model_id.endswith(":free")
+
+        r = c.post(
+            f"{PROXY_URL}/api/openrouter/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {proxy_key}"},
+            json={"model": model_id, "messages": [{"role": "user", "content": PROMPT}]},
+        )
+        assert r.status_code == 200, r.text
+        content = r.json()["choices"][0]["message"]["content"]
+        assert isinstance(content, str) and content.strip() != ""
+
+
 def test_schema_real_shir_man_response_parses():
     r = httpx.get(SHIR_MAN_URL, timeout=30.0)
     assert r.status_code == 200

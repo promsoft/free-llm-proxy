@@ -25,6 +25,9 @@ Anthropic-шима (`/api/anthropic`), здесь **модель указыва�
 - **Изоляция** — ошибки upstream (`429`/`5xx`) уходят клиенту as-is и
   **не** трогают общую cooldown-таблицу / registry.
 - **Префикс** — `/api/openrouter`, симметрично `/api/anthropic`.
+- **Провизионные пути режем** (решение 2026-08-17, вторым заходом):
+  ключевые/аккаунтные эндпоинты OpenRouter через прокси недоступны —
+  см. блоклист в §2.1.
 
 ## 2. Точки входа (namespace `/api/openrouter`)
 
@@ -49,6 +52,22 @@ base_url = http://localhost:8080/api/openrouter/api/v1
 - Реализация — catch-all route (`/{path:path}`) в новом роутере
   `api/openrouter.py`, никакой валидации тела: JSON, SSE, бинарные
   ответы — всё байт-в-байт.
+
+### 2.1. Блоклист: провизионные/аккаунтные пути
+
+Пути управления ключами и аккаунтом OpenRouter через прокси **не
+проксируются** — `PROXY_API_KEY` даёт доступ к инференсу, а не к
+управлению чужим `OPENROUTER_API_KEY`. Блокируются хвосты (после
+нормализации алиаса, без учёта регистра, по префиксу сегментов):
+
+- `api/v1/key`, `api/v1/keys` — информация о ключе и provisioning-ключи;
+- `api/v1/credits` — баланс/кредиты аккаунта;
+- `api/v1/auth` — OAuth-обмен ключей.
+
+Ответ — `403` в нашем OpenAI-style формате:
+`{"error":{"code":"forbidden_path","message":"This OpenRouter path is not exposed via the proxy."}}`.
+До upstream такой запрос не доходит. Список захардкожен (не env):
+расширение — правкой кода.
 
 ## 3. Аутентификация
 
@@ -183,6 +202,10 @@ src/free_llm_proxy/
 - `401` от upstream → `502 upstream_auth_error` (хвост ключа в тексте).
 - сетевая ошибка → `502 upstream_unreachable`.
 - auth: без ключа → `401`, с неверным → `403` (OpenAI-style формат).
+- блоклист (§2.1): `api/v1/credits`, `api/v1/keys`, `api/v1/key`,
+  `v1/keys` (через алиас) → `403 forbidden_path`, upstream **не**
+  вызывался; соседние пути (`api/v1/keysmith` — гипотетический) не
+  задеты префиксным матчем по сегментам.
 - `OPENROUTER_PROXY_ENABLED=false` → `404` на любой путь namespace.
 
 Live (`@pytest.mark.live`, в `tests/test_live.py`): один реальный POST
@@ -197,6 +220,6 @@ Live (`@pytest.mark.live`, в `tests/test_live.py`): один реальный P
 - Нужен ли отдельный (второй) входной ключ для этого namespace, чтобы
   раздавать доступ «только к passthrough» или «только к fallback»
   отдельно? Пока нет — общий `PROXY_API_KEY`.
-- Стоит ли резать провизионные пути OpenRouter (`/api/v1/keys`,
-  `/api/v1/credits`), доступные по тому же ключу? Пока не режем —
-  «прозрачный» значит прозрачный.
+
+> Вопрос о провизионных путях (`/api/v1/keys`, `/api/v1/credits`)
+> закрыт 2026-08-17: **режем**, см. §2.1.

@@ -24,6 +24,12 @@ upstream_attempts_total = Counter(
     ["model_id", "outcome"],
     registry=REGISTRY,
 )
+openrouter_proxy_requests_total = Counter(
+    "freellm_openrouter_proxy_requests_total",
+    "OpenRouter passthrough (/api/openrouter) requests by method and terminal status.",
+    ["method", "status"],
+    registry=REGISTRY,
+)
 active_models = Gauge(
     "freellm_active_models",
     "Models in the current snapshot.",

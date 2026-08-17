@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     anthropic_api_enabled: bool = True
     anthropic_tokens_per_char_divisor: float = 4.0
 
+    # OpenRouter passthrough (/api/openrouter). See spec/openrouter.md.
+    openrouter_proxy_enabled: bool = True
+    openrouter_proxy_base: str = "https://openrouter.ai"
+    openrouter_proxy_timeout_sec: float = 120.0
+
 
 _settings: Settings | None = None
 
